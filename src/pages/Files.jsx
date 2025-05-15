@@ -12,7 +12,7 @@ import {
   Icon,
   Banner,
 } from "@shopify/polaris";
-import { SearchIcon, DeleteIcon } from "@shopify/polaris-icons";
+import { SearchIcon, DeleteIcon, NoteIcon } from "@shopify/polaris-icons";
 import axios from "axios";
 
 const server = import.meta.env.VITE_API_BASE_URL;
@@ -87,22 +87,28 @@ export function Files() {
     fetchFiles();
   }, [pagination?.page, pagination?.limit]);
 
-  const fileTypeIcon = (fileType) => {
-    if (fileType.includes("image")) return "image";
-    if (fileType.includes("pdf")) return "pdf";
-    if (fileType.includes("text")) return "document";
+  const getFileIcon = (fileType) => {
+    if (!fileType) return NoteIcon;
+
+    const type = fileType.toLowerCase();
+    if (type.includes("image")) return "image";
+    if (type.includes("pdf")) return "pdf";
+    if (type.includes("word") || type.includes("document")) return "document";
+    if (type.includes("spreadsheet") || type.includes("excel"))
+      return "columns";
+    if (type.includes("zip") || type.includes("compressed")) return "archive";
     return "document";
   };
 
   const rows = files?.map((file) => [
-    <Stack alignment="center" key={file._id}>
+    <BlockStack alignment="center" key={file._id}>
       <Thumbnail
-        source={fileTypeIcon(file.fileType)}
+        source={getFileIcon(file.fileType)}
         alt={file.originalName}
         size="small"
       />
       <span>{file.originalName}</span>
-    </Stack>,
+    </BlockStack>,
     `${(file.size / (1024 * 1024)).toFixed(2)} MB`,
     file.fileType,
     new Date(file.uploadDate).toLocaleDateString(),

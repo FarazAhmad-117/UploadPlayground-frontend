@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   DropZone,
   Card,
@@ -9,6 +9,7 @@ import {
   ProgressBar,
   Badge,
   InlineStack,
+  Checkbox,
 } from "@shopify/polaris";
 import { NoteIcon, DeleteIcon } from "@shopify/polaris-icons";
 import axios from "axios";
@@ -19,27 +20,77 @@ const FileUploader = () => {
   const [uploadQueue, setUploadQueue] = useState([]);
   const [activeUploads, setActiveUploads] = useState(0);
   const [errors, setErrors] = useState([]);
+  const [selectedFiles, setSelectedFiles] = useState(new Set());
+  const processingRef = useRef(false);
   const MAX_CONCURRENT_UPLOADS = 2;
 
+  const dropTimeout = useRef(null);
   const handleDrop = useCallback((_droppedFiles, acceptedFiles) => {
-    addToQueue(acceptedFiles);
+    if (dropTimeout.current) clearTimeout(dropTimeout.current);
+    dropTimeout.current = setTimeout(() => {
+      addToQueue(acceptedFiles);
+    }, 100);
   }, []);
 
   const addToQueue = (newFiles) => {
-    setUploadQueue((prev) => [
-      ...prev,
-      ...newFiles.map((file) => ({
-        file,
-        id: Math.random().toString(36).substr(2, 9),
-        status: "queued",
-        progress: 0,
-        error: null,
-      })),
-    ]);
+    setUploadQueue((prev) => {
+      const existingFileSet = new Set(
+        prev.map((item) => item.file.name + item.file.size)
+      );
+      const uniqueFiles = newFiles.filter(
+        (file) => !existingFileSet.has(file.name + file.size)
+      );
+
+      return [
+        ...prev,
+        ...uniqueFiles.map((file) => ({
+          file,
+          id: Math.random().toString(36).substr(2, 9),
+          status: "queued",
+          progress: 0,
+          error: null,
+        })),
+      ];
+    });
   };
 
   const removeFromQueue = (id) => {
     setUploadQueue((prev) => prev.filter((item) => item.id !== id));
+    setSelectedFiles((prev) => {
+      const newSet = new Set(prev);
+      newSet.delete(id);
+      return newSet;
+    });
+  };
+
+  // Add multi-select handlers
+  const toggleFileSelection = (id) => {
+    setSelectedFiles((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(id)) {
+        newSet.delete(id);
+      } else {
+        newSet.add(id);
+      }
+      return newSet;
+    });
+  };
+
+  const removeSelected = () => {
+    setUploadQueue((prev) =>
+      prev.filter((item) => !selectedFiles.has(item.id))
+    );
+    setSelectedFiles(new Set());
+  };
+
+  const retrySelected = () => {
+    setUploadQueue((prev) =>
+      prev.map((item) =>
+        selectedFiles.has(item.id) && item.status === "failed"
+          ? { ...item, status: "queued", error: null }
+          : item
+      )
+    );
   };
 
   const uploadFile = async (queueItem) => {
@@ -50,7 +101,7 @@ const FileUploader = () => {
       const response = await axios.post(`${server}/api/upload`, formData, {
         onUploadProgress: (progressEvent) => {
           const progress = Math.round(
-            (progressEvent.loaded * 100) / progressEvent.total
+            (progressEvent.loaded * 100) / (progressEvent.total || 1)
           );
           setUploadQueue((prev) =>
             prev.map((item) =>
@@ -63,7 +114,6 @@ const FileUploader = () => {
         },
       });
 
-      // Handle successful upload
       setUploadQueue((prev) =>
         prev.map((item) =>
           item.id === queueItem.id
@@ -71,16 +121,22 @@ const FileUploader = () => {
                 ...item,
                 status: "completed",
                 progress: 100,
-                fileData: response.data.files[0], // Assuming single file response
+                fileData: response.data.uploadedFiles?.[0] || {
+                  url: "#",
+                  filename: queueItem.file.name,
+                  size: queueItem.file.size,
+                },
               }
             : item
         )
       );
       return true;
     } catch (error) {
-      // Handle upload error
       const errorMessage =
-        error.response?.data?.error || error.message || "Failed to upload file";
+        error.response?.data?.error ||
+        error.response?.data?.message ||
+        error.message ||
+        "Failed to upload file";
       setUploadQueue((prev) =>
         prev.map((item) =>
           item.id === queueItem.id
@@ -97,44 +153,62 @@ const FileUploader = () => {
   };
 
   const processQueue = useCallback(async () => {
-    if (activeUploads >= MAX_CONCURRENT_UPLOADS || uploadQueue.length === 0) {
+    if (processingRef.current) return;
+    processingRef.current = true;
+
+    const queuedItems = uploadQueue.filter((item) => item.status === "queued");
+    const availableSlots = MAX_CONCURRENT_UPLOADS - activeUploads;
+    const nextBatch = queuedItems.slice(0, availableSlots);
+
+    if (nextBatch.length === 0) {
+      processingRef.current = false;
       return;
     }
 
-    const nextBatch = uploadQueue
-      .filter((item) => item.status === "queued")
-      .slice(0, MAX_CONCURRENT_UPLOADS - activeUploads);
-
-    if (nextBatch.length === 0) return;
+    // Mark files as uploading
+    setUploadQueue((prev) =>
+      prev.map((item) =>
+        nextBatch.some((n) => n.id === item.id)
+          ? { ...item, status: "uploading" }
+          : item
+      )
+    );
 
     setActiveUploads((prev) => prev + nextBatch.length);
 
-    // Process each file in the batch
-    const uploadPromises = nextBatch.map(async (item) => {
-      // Update status to uploading
-      setUploadQueue((prev) =>
-        prev.map((qItem) =>
-          qItem.id === item.id ? { ...qItem, status: "uploading" } : qItem
-        )
-      );
+    const uploadResults = await Promise.all(
+      nextBatch.map(async (item) => {
+        const success = await uploadFile(item);
+        return { id: item.id, success };
+      })
+    );
 
-      const success = await uploadFile(item);
+    const upCommingUploadQueue = uploadQueue.filter(
+      (item) => !nextBatch.some((n) => n.id === item.id)
+    );
+    setUploadQueue(upCommingUploadQueue);
 
-      setActiveUploads((prev) => prev - 1);
-      if (success) {
-        // Process next in queue after a small delay
-        setTimeout(processQueue, 300);
-      } else {
-        processQueue();
-      }
-    });
+    // Update active uploads
+    setActiveUploads((prev) => prev - nextBatch.length);
 
-    await Promise.all(uploadPromises);
-  }, [activeUploads, uploadQueue]);
+    processingRef.current = false;
+
+    // Re-process the queue if any were successful or still queued
+    if (
+      upCommingUploadQueue.some((item) => item.status === "queued") ||
+      uploadResults.some((res) => !res.success)
+    ) {
+      //   console.log("Here is the uploaded queue", uploadQueue);
+      setTimeout(() => processQueue(), 200);
+    }
+  }, [uploadQueue, activeUploads]);
 
   useEffect(() => {
-    processQueue();
-  }, [uploadQueue, processQueue]);
+    if (!processingRef.current) {
+      //   console.log("Here is the uploaded queue", uploadQueue);
+      processQueue();
+    }
+  }, [uploadQueue, activeUploads, processQueue]);
 
   // Filter files by status
   const uploadingFiles = uploadQueue.filter(
@@ -172,6 +246,20 @@ const FileUploader = () => {
         </Banner>
       )}
 
+      {selectedFiles.size > 0 && (
+        <Card sectioned>
+          <InlineStack align="space-between">
+            <span>{selectedFiles.size} selected</span>
+            <InlineStack gap="200">
+              <Button onClick={retrySelected}>Retry Selected</Button>
+              <Button destructive onClick={removeSelected}>
+                Remove Selected
+              </Button>
+            </InlineStack>
+          </InlineStack>
+        </Card>
+      )}
+
       <Card title="Upload Queue" sectioned>
         <BlockStack vertical spacing="loose">
           {uploadQueue.length === 0 && (
@@ -182,103 +270,80 @@ const FileUploader = () => {
             </Banner>
           )}
 
-          {uploadingFiles.map((item) => (
+          {[
+            ...uploadingFiles,
+            ...queuedFiles,
+            ...failedFiles,
+            ...completedFiles,
+          ].map((item) => (
             <div key={item.id} className="space-y-2">
               <div className="flex items-center justify-between gap-4">
                 <div className="flex items-center gap-2 flex-1 min-w-0">
+                  <Checkbox
+                    checked={selectedFiles.has(item.id)}
+                    onChange={() => toggleFileSelection(item.id)}
+                  />
                   <Thumbnail source={NoteIcon} alt={item.file.name} />
-                  <span className="truncate">{item.file.name}</span>
-                  <Badge status="attention">Uploading</Badge>
-                </div>
-                <Button
-                  icon={DeleteIcon}
-                  onClick={() => removeFromQueue(item.id)}
-                  plain
-                />
-              </div>
-              <ProgressBar progress={item.progress} size="small" />
-            </div>
-          ))}
-
-          {queuedFiles.map((item) => (
-            <div
-              key={item.id}
-              className="flex items-center justify-between gap-4"
-            >
-              <div className="flex items-center gap-2 flex-1 min-w-0">
-                <Thumbnail source={NoteIcon} alt={item.file.name} />
-                <span className="truncate">{item.file.name}</span>
-                <Badge status="new">Queued</Badge>
-              </div>
-              <Button
-                icon={DeleteIcon}
-                onClick={() => removeFromQueue(item.id)}
-                plain
-              />
-            </div>
-          ))}
-
-          {failedFiles.map((item) => (
-            <div
-              key={item.id}
-              className="flex items-center justify-between gap-4"
-            >
-              <div className="flex items-center gap-2 flex-1 min-w-0">
-                <Thumbnail source={NoteIcon} alt={item.file.name} />
-                <span className="truncate text-red-600">{item.file.name}</span>
-                <Badge status="critical">Failed</Badge>
-              </div>
-              <InlineStack gap="200">
-                <Button
-                  size="slim"
-                  onClick={() => {
-                    setUploadQueue((prev) =>
-                      prev.map((qItem) =>
-                        qItem.id === item.id
-                          ? { ...qItem, status: "queued", error: null }
-                          : qItem
-                      )
-                    );
-                  }}
-                >
-                  Retry
-                </Button>
-                <Button
-                  icon={DeleteIcon}
-                  onClick={() => removeFromQueue(item.id)}
-                  plain
-                />
-              </InlineStack>
-            </div>
-          ))}
-
-          {completedFiles.map((item) => (
-            <div
-              key={item.id}
-              className="flex items-center justify-between gap-4"
-            >
-              <div className="flex items-center gap-2 flex-1 min-w-0">
-                <Thumbnail source={NoteIcon} alt={item.file.name} />
-                <span className="truncate text-green-600">
-                  {item.file.name}
-                </span>
-                <Badge status="success">Completed</Badge>
-              </div>
-              <InlineStack gap="200">
-                {item.fileData?.url && (
-                  <Button
-                    size="slim"
-                    onClick={() => window.open(item.fileData.url, "_blank")}
+                  <span
+                    className={`truncate ${
+                      item.status === "failed"
+                        ? "text-red-600"
+                        : item.status === "completed"
+                        ? "text-green-600"
+                        : ""
+                    }`}
                   >
-                    View
-                  </Button>
-                )}
-                <Button
-                  icon={DeleteIcon}
-                  onClick={() => removeFromQueue(item.id)}
-                  plain
-                />
-              </InlineStack>
+                    {item.file.name}
+                  </span>
+                  <Badge
+                    status={
+                      item.status === "uploading"
+                        ? "attention"
+                        : item.status === "queued"
+                        ? "new"
+                        : item.status === "failed"
+                        ? "critical"
+                        : "success"
+                    }
+                  >
+                    {item.status}
+                  </Badge>
+                </div>
+                <InlineStack gap="200">
+                  {item.status === "failed" && (
+                    <Button
+                      size="slim"
+                      onClick={() => {
+                        setUploadQueue((prev) =>
+                          prev.map((qItem) =>
+                            qItem.id === item.id
+                              ? { ...qItem, status: "queued", error: null }
+                              : qItem
+                          )
+                        );
+                      }}
+                    >
+                      Retry
+                    </Button>
+                  )}
+                  {item.status === "completed" && item.fileData?.url && (
+                    <Button
+                      size="slim"
+                      onClick={() => window.open(item.fileData.url, "_blank")}
+                    >
+                      View
+                    </Button>
+                  )}
+                  <Button
+                    icon={DeleteIcon}
+                    onClick={() => removeFromQueue(item.id)}
+                    plain
+                  />
+                </InlineStack>
+              </div>
+              {item.status === "uploading" && (
+                <ProgressBar progress={item.progress} size="small" />
+              )}
             </div>
           ))}
         </BlockStack>
