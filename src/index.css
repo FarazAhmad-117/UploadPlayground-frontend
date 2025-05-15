@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom Polaris overrides */
+.Polaris-Navigation__Item:hover:not(.Polaris-Navigation__Item--selected) {
+  background-color: rgba(227, 227, 227, 0.5);
+}
+
+.Polaris-Navigation__Item--selected {
+  background-color: rgba(227, 227, 227, 0.7);
+}
+
+.Polaris-TopBar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+/* Smooth transitions for navigation */
+.Polaris-Frame__Navigation {
+  transition: transform 200ms cubic-bezier(0.36, 0.66, 0.04, 1);
+}
